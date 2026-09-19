@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:;">
+<title>yashirolang IDE</title>
+<link rel="stylesheet" href="/node_modules/monaco-editor/min/vs/editor/editor.main.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-theme="dark">
+
+<!-- ツールバー：Arduino と同じで「確認」「実行」が左端 -->
+<div id="toolbar">
+  <button id="btn-check" class="tb" title="確認（型検査だけ・⌘R）">✔<span>確認</span></button>
+  <button id="btn-run"   class="tb primary" title="実行（⌘⏎）">▶<span>実行</span></button>
+  <button id="btn-stop"  class="tb danger" title="停止（⌘.）" disabled>■<span>停止</span></button>
+
+  <span class="sep"></span>
+
+  <button id="btn-debug"     class="tb" title="デバッグ実行（F5）">🐞<span>デバッグ</span></button>
+  <button id="btn-continue"  class="tb icon" title="続行（F8）" disabled>⏵</button>
+  <button id="btn-step-over" class="tb icon" title="ステップオーバー（F10）" disabled>⤼</button>
+  <button id="btn-step-into" class="tb icon" title="ステップイン（F11）" disabled>⤓</button>
+  <button id="btn-step-out"  class="tb icon" title="ステップアウト（⇧F11）" disabled>⤒</button>
+
+  <span class="grow"></span>
+  <span id="state-pill" class="pill">待機中</span>
+  <button id="btn-settings" class="tb icon" title="設定（⌘,）">⚙</button>
+</div>
+
+<div id="body">
+  <!-- 左：フォルダ -->
+  <aside id="sidebar">
+    <div class="side-head">
+      <span id="root-name">フォルダ未選択</span>
+      <span class="grow"></span>
+      <button id="btn-new-file"   class="mini" title="新しいファイル">＋</button>
+      <button id="btn-new-folder" class="mini" title="新しいフォルダ">📁</button>
+      <button id="btn-refresh"    class="mini" title="読み直す">⟳</button>
+    </div>
+    <div id="tree" tabindex="0">
+      <div class="empty">
+        <p>フォルダを開くと、ここにファイルが並びます。</p>
+        <button id="btn-open-folder" class="wide">フォルダを開く…</button>
+      </div>
+    </div>
+  </aside>
+
+  <div id="splitter-x" class="splitter vertical"></div>
+
+  <!-- 右：タブ＋エディタ＋下のパネル -->
+  <main id="main">
+    <div id="tabs"></div>
+    <div id="editor-wrap">
+      <div id="editor"></div>
+      <div id="editor-empty" class="empty big">
+        <p>ファイルを選ぶか、新しく作ってください。</p>
+      </div>
+    </div>
+
+    <div id="splitter-y" class="splitter horizontal"></div>
+
+    <section id="panel">
+      <div id="panel-tabs">
+        <button class="ptab active" data-panel="console">出力</button>
+        <button class="ptab" data-panel="problems">問題 <span id="problem-count" class="badge">0</span></button>
+        <button class="ptab" data-panel="debug">デバッグ</button>
+        <span class="grow"></span>
+        <button id="btn-clear-console" class="mini" title="消す">🗑</button>
+      </div>
+
+      <div class="panel-page active" id="page-console">
+        <pre id="console"></pre>
+        <div id="stdin-bar">
+          <input id="stdin" type="text" placeholder="プログラムへの入力（Enter で送る）" disabled>
+        </div>
+      </div>
+
+      <div class="panel-page" id="page-problems">
+        <div id="problems"><div class="empty small">問題はありません。</div></div>
+      </div>
+
+      <div class="panel-page" id="page-debug">
+        <div id="debug-grid">
+          <div class="dcol">
+            <h4>呼び出し履歴</h4>
+            <div id="frames"><div class="empty small">デバッグしていません。</div></div>
+          </div>
+          <div class="dcol">
+            <h4>ブレークポイント</h4>
+            <div id="bplist"><div class="empty small">行番号の左をクリックすると付きます。</div></div>
+          </div>
+          <div class="dcol">
+            <h4>変数 / 評価</h4>
+            <div id="locals" class="mono"></div>
+            <input id="eval-input" type="text" placeholder="式を入れて Enter" disabled>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="statusbar">
+  <span id="st-file">—</span>
+  <span class="grow"></span>
+  <span id="st-pos">1:1</span>
+  <span id="st-tool" class="dim">コンパイラを探しています…</span>
+</div>
+
+<!-- 設定 -->
+<dialog id="settings-dialog">
+  <form method="dialog">
+    <h3>設定</h3>
+    <label>コンパイラ（yashirolang）
+      <div class="row">
+        <input id="set-compiler" type="text" placeholder="空なら自動で探します">
+        <button id="set-compiler-pick" type="button">選ぶ…</button>
+      </div>
+    </label>
+    <label>デバッガ（lldb / gdb）
+      <input id="set-debugger" type="text" placeholder="空なら自動で探します">
+    </label>
+    <label>最適化
+      <select id="set-opt">
+        <option>-O0</option><option>-O1</option><option>-O2</option><option>-O3</option>
+      </select>
+    </label>
+    <label>追加の引数
+      <input id="set-extra" type="text" placeholder="例: --warn-own -I lib">
+    </label>
+    <label>文字の大きさ
+      <input id="set-font" type="number" min="9" max="28" step="1">
+    </label>
+    <label class="check">
+      <input id="set-autosave" type="checkbox"> ビルドの前に保存する
+    </label>
+    <div id="tool-report" class="mono dim"></div>
+    <menu>
+      <button value="cancel">閉じる</button>
+      <button id="set-save" value="save" class="primary">保存</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- 名前を尋ねる小さな窓（新規作成・名前の変更） -->
+<dialog id="name-dialog">
+  <form method="dialog">
+    <h3 id="name-title">新しいファイル</h3>
+    <input id="name-input" type="text" autocomplete="off">
+    <menu>
+      <button value="cancel">キャンセル</button>
+      <button value="ok" class="primary">作成</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="/node_modules/monaco-editor/min/vs/loader.js"></script>
+<script src="yashirolang-language.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+out/
+.DS_Store
+*.log
+
+# ビルドの中間物（IDE が作る）
+.ysbuild/
