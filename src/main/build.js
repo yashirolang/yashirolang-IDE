@@ -9,6 +9,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { compilerEnv, findCompiler } = require('./toolchain');
 const diagnostics = require('./diagnostics');
+const sources = require('./sources');
 
 let running = null;   // いま走っているコンパイル（同時に 1 本だけ）
 
@@ -56,6 +57,23 @@ function invoke(compiler, args, cwd, onOutput) {
   });
 }
 
+// ⚠️ **import した先のエラーは、相対パスで返ってきます**（`bad_util.ys:2:14`）。
+//   そのままだと「問題」一覧から飛べないので、ここで絶対パスに直します。
+//   基準はコンパイラを走らせた場所（入口ファイルのディレクトリ）です。
+function absolutize(diags, cwd) {
+  const map = sources.sourceMap([cwd], {});
+  const fix = (d) => {
+    if (!d || !d.file) return d;
+    d.file = sources.resolveSource(map, d.file, { cwd });
+    return d;
+  };
+  for (const d of diags) {
+    fix(d);
+    for (const det of d.details || []) fix(det);
+  }
+  return diags;
+}
+
 function baseArgs(settings, source) {
   const args = [];
   // import をソースのフォルダからも探せるようにする（ysm の deps も見る）
@@ -72,8 +90,9 @@ async function check(settings, source, onOutput) {
   if (!compiler) return { ok: false, diagnostics: [], output: 'コンパイラ（yashirolang）が見つかりません。設定で場所を指定してください。\n' };
 
   const args = [...baseArgs(settings, source), '--check', ...splitArgs(settings.extraArgs), source];
-  const r = await invoke(compiler, args, path.dirname(source), onOutput);
-  const diags = diagnostics.parse(r.output);
+  const cwd = path.dirname(source);
+  const r = await invoke(compiler, args, cwd, onOutput);
+  const diags = absolutize(diagnostics.parse(r.output), cwd);
   const ok = r.code === 0 && !diags.some((d) => d.severity === 'error');
   return { ok, diagnostics: diags, output: r.output, exe: null };
 }
@@ -91,8 +110,9 @@ async function compile(settings, source, { debug = false } = {}, onOutput) {
   args.push(...splitArgs(settings.extraArgs));
   args.push(source, '-o', out);
 
-  const r = await invoke(compiler, args, path.dirname(source), onOutput);
-  const diags = diagnostics.parse(r.output);
+  const cwd = path.dirname(source);
+  const r = await invoke(compiler, args, cwd, onOutput);
+  const diags = absolutize(diagnostics.parse(r.output), cwd);
   const ok = r.code === 0 && fs.existsSync(out);
   return { ok, diagnostics: diags, output: r.output, exe: ok ? out : null };
 }

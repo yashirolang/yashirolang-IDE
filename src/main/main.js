@@ -14,6 +14,8 @@ const build = require('./build');
 const runner = require('./run');
 const { DebugSession } = require('./debug');
 const buildMenu = require('./menu');
+const sources = require('./sources');
+const symbols = require('./symbols');
 
 let win = null;
 let session = null;        // いま動いているデバッグ
@@ -100,6 +102,52 @@ function guard(p) {
   return p;
 }
 
+// ── 読むだけなら外も許す場所 ───────────────────────────
+//
+// 🤔 なぜ緩めるのか
+//   `import strings` の中で止まったとき、その行を見せられないと
+//   デバッグになりません。標準ライブラリと deps は**書けないまま、
+//   読むことだけ**を許します。
+//   ⚠️ 書き込み（fs:write / rename / remove）は今までどおり
+//     「開いているフォルダの中だけ」です。ここは触りません。
+function readableDirs() {
+  const st = settingsStore.load();
+  const compiler = toolchain.findCompiler(st.compilerPath);
+  const out = [];
+  if (openFolder) out.push(openFolder);
+  if (compiler) {
+    const lib = toolchain.libDirOf(compiler);
+    if (lib) out.push(lib);
+  }
+  return out;
+}
+
+function guardRead(p) {
+  if (!p) throw new Error('パスが空です');
+  for (const d of readableDirs()) {
+    if (files.insideRoot(d, p)) return { path: p, readonly: !(openFolder && files.insideRoot(openFolder, p)) };
+  }
+  throw new Error('開いているフォルダと標準ライブラリの外は読めません');
+}
+
+// import と定義へ移動が探す場所（処理系と同じ順）
+function searchDirsFor(file) {
+  const st = settingsStore.load();
+  const compiler = toolchain.findCompiler(st.compilerPath);
+  return sources.searchDirs({
+    entryDir: file ? path.dirname(file) : openFolder,
+    root: openFolder,
+    libDir: compiler ? toolchain.libDirOf(compiler) : null,
+    extraArgs: st.extraArgs,
+  });
+}
+
+// symbols.js へ渡す「まわりの事情」
+const symbolCtx = {
+  get settings() { return settingsStore.load(); },
+  dirs: (file) => searchDirsFor(file),
+};
+
 // 例外をそのまま画面に返す薄い包み
 function handle(channel, fn) {
   ipcMain.handle(channel, async (_e, ...args) => {
@@ -163,13 +211,70 @@ handle('fs:tree', async (dir) => {
   guard(target);
   return { root: openFolder, dir: target, items: await files.readDir(target) };
 });
-handle('fs:read', (p) => files.readFile(guard(p)));
+
+// ★ 読むだけの窓口。標準ライブラリと deps の中も開けます（書けません）。
+handle('fs:open', async (p) => {
+  const g = guardRead(p);
+  return { path: g.path, text: await files.readFile(g.path), readonly: g.readonly };
+});
+
+// 標準ライブラリの一覧（左の「ライブラリ」に並べます）
+handle('fs:library', async () => {
+  const st = settingsStore.load();
+  const compiler = toolchain.findCompiler(st.compilerPath);
+  const out = [];
+  const lib = compiler ? toolchain.libDirOf(compiler) : null;
+  if (lib && fs.existsSync(lib)) {
+    out.push({ name: '標準ライブラリ', dir: lib, items: await files.readDir(lib) });
+  }
+  // ysm が置く deps/（package.toml のある木）
+  const deps = openFolder ? path.join(openFolder, 'deps') : null;
+  if (deps && fs.existsSync(deps)) {
+    out.push({ name: 'deps（ysm）', dir: deps, items: await files.readDir(deps) });
+  }
+  return out;
+});
+
+// 入口（`def main()` のあるファイル）を探す。複数ファイルのとき、
+// どれを建てればよいかを画面が決めるために使います。
+handle('fs:entries', async () => {
+  if (!openFolder) return [];
+  const map = sources.sourceMap([openFolder], { root: openFolder });
+  const out = [];
+  for (const list of map.values()) {
+    for (const p of list) {
+      try {
+        if (/^\s*def\s+main\s*\(/m.test(fs.readFileSync(p, 'utf8'))) out.push(p);
+      } catch { /* 読めないものは飛ばす */ }
+    }
+  }
+  return out.sort();
+});
 handle('fs:write', (p, c) => files.writeFile(guard(p), c));
 handle('fs:createFile', (dir, name) => files.createFile(guard(dir), name));
 handle('fs:createFolder', (dir, name) => files.createFolder(guard(dir), name));
 handle('fs:rename', (p, name) => files.rename(guard(p), name));
 handle('fs:remove', (p) => files.remove(guard(p), (t) => shell.trashItem(t)));
 handle('fs:reveal', (p) => { shell.showItemInFolder(guard(p)); return true; });
+
+// ── 名前（定義へ移動・型の表示）─────────────────────────
+//
+// ★ 編集中の中身（text）を一緒に受け取ります。保存していなくても
+//   いまの中身で答えるためです。
+handle('symbols:definition', (file, text, line, character) => {
+  guardRead(file);
+  return symbols.definition(symbolCtx, { file, text, line, character });
+});
+
+handle('symbols:hover', (file, text, line, character) => {
+  guardRead(file);
+  return symbols.hover(symbolCtx, { file, text, line, character });
+});
+
+handle('symbols:outline', (file, text) => {
+  guardRead(file);
+  return symbols.outline(symbolCtx, { file, text });
+});
 
 // ── ビルド ─────────────────────────────────────────────
 handle('build:check', async (src) => {
@@ -237,8 +342,26 @@ handle('debug:start', async (src, breakpoints) => {
     return { started: false, ...r };
   }
 
+  // ★ 複数ファイルのための地図。
+  //   止まった場所が import した先でも標準ライブラリでも、
+  //   ここでファイル名から本当の場所を引けるようにしておきます。
+  const map = sources.sourceMap(searchDirsFor(src), { root: openFolder });
+  const bps = breakpoints || [];
+  // ⚠️ デバッガはファイル**名**でしか場所を指せません（DWARF に入って
+  //   いるのが名前だけだからです）。同じ名前が 2 か所にあると、
+  //   置いたつもりでない方で止まります。黙って進まず、先に言います。
+  for (const a of sources.ambiguous(map, bps.map((b) => b.file))) {
+    emit('console', {
+      stream: 'err',
+      text: `⚠️ ${a.name} が ${a.where.length} か所にあります。`
+        + 'デバッガはファイル名でしか区別できないので、どちらで止まるか決まりません:\n'
+        + a.where.map((w) => '    ' + w).join('\n') + '\n',
+    });
+  }
+
   session = new DebugSession(
-    { debuggerPath: dbg.path, kind: dbg.kind, exe: r.exe, cwd: path.dirname(src), source: src, args: [] },
+    { debuggerPath: dbg.path, kind: dbg.kind, exe: r.exe, cwd: path.dirname(src),
+      source: src, args: [], sourceMap: map },
     (type, payload) => {
       if (type === 'stdout') emit('console', { stream: 'stdout', text: payload });
       else if (type === 'log') emit('debug:log', payload);
@@ -255,7 +378,7 @@ handle('debug:start', async (src, breakpoints) => {
   );
 
   emit('console', { stream: 'info', text: `${dbg.kind} で起動します。\n` });
-  const first = await session.start(breakpoints || []);
+  const first = await session.start(bps);
   return { started: true, exe: r.exe, kind: dbg.kind, first, diagnostics: r.diagnostics };
 });
 
@@ -273,13 +396,24 @@ handle('debug:cmd', async (cmd) => {
 
 handle('debug:addBreakpoint', async (file, line) => {
   if (!session) return false;
-  await session.addBreakpoint(file, line);
-  return true;
+  return session.addBreakpoint(file, line);
+});
+
+// 呼び出し履歴で枠を選ぶ（選んだ枠の変数が見えます）
+handle('debug:selectFrame', async (index) => {
+  if (!session) throw new Error('デバッグしていません');
+  return session.selectFrame(index);
 });
 
 handle('debug:evaluate', async (expr) => {
   if (!session) throw new Error('デバッグしていません');
   return session.evaluate(expr);
+});
+
+// 参照型（list / クラス / rc）の中身を 1 段開く（A-35）
+handle('debug:expand', async (expr) => {
+  if (!session) throw new Error('デバッグしていません');
+  return session.expand(expr);
 });
 
 handle('debug:stdin', (data) => (session ? session.writeStdin(data) : false));

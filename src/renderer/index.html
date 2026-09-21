@@ -19,7 +19,7 @@
   <span class="sep"></span>
 
   <button id="btn-debug"     class="tb" title="デバッグ実行（F5）">🐞<span>デバッグ</span></button>
-  <button id="btn-continue"  class="tb icon" title="続行（F8）" disabled>⏵</button>
+  <button id="btn-continue"  class="tb icon" title="続行（F8）／走っている間は一時停止（F6）" disabled>⏵</button>
   <button id="btn-step-over" class="tb icon" title="ステップオーバー（F10）" disabled>⤼</button>
   <button id="btn-step-into" class="tb icon" title="ステップイン（F11）" disabled>⤓</button>
   <button id="btn-step-out"  class="tb icon" title="ステップアウト（⇧F11）" disabled>⤒</button>
@@ -45,6 +45,12 @@
         <button id="btn-open-folder" class="wide">フォルダを開く…</button>
       </div>
     </div>
+
+    <!-- ライブラリ：import で使える物の置き場。読むだけです -->
+    <div id="lib-head" class="side-head lib" title="import で使えるもの（読むだけ）">
+      <span class="tw">▸</span><span>ライブラリ</span>
+    </div>
+    <div id="lib-tree" style="display:none"></div>
   </aside>
 
   <div id="splitter-x" class="splitter vertical"></div>
@@ -92,7 +98,8 @@
             <div id="bplist"><div class="empty small">行番号の左をクリックすると付きます。</div></div>
           </div>
           <div class="dcol">
-            <h4>変数 / 評価</h4>
+            <h4>変数 / 評価 <span id="frame-label" class="dim"></span></h4>
+            <input id="var-filter" type="text" placeholder="名前で絞る" disabled>
             <div id="locals" class="mono"></div>
             <input id="eval-input" type="text" placeholder="式を入れて Enter" disabled>
           </div>
@@ -104,6 +111,7 @@
 
 <div id="statusbar">
   <span id="st-file">—</span>
+  <span id="st-entry" class="dim" title="実行・デバッグで建てるファイル（クリックで入口を切り替え）"></span>
   <span class="grow"></span>
   <span id="st-pos">1:1</span>
   <span id="st-tool" class="dim">コンパイラを探しています…</span>
@@ -126,6 +134,12 @@
       <select id="set-opt">
         <option>-O0</option><option>-O1</option><option>-O2</option><option>-O3</option>
       </select>
+    </label>
+    <label>入口のファイル（複数ファイルのとき建てるもの）
+      <div class="row">
+        <input id="set-entry" type="text" placeholder="空なら、いま開いている .ys">
+        <button id="set-entry-here" type="button">いまのファイル</button>
+      </div>
     </label>
     <label>追加の引数
       <input id="set-extra" type="text" placeholder="例: --warn-own -I lib">

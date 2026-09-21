@@ -217,8 +217,22 @@ button.wide:hover { background: var(--sel); }
 .dcol h4 { margin: 0; padding: 5px 10px; font-size: 11px; color: var(--fg-dim);
            font-weight: 600; border-bottom: 1px solid var(--line); }
 .dcol > div { flex: 1; overflow: auto; }
-#locals { padding: 6px 10px; font-size: 11.5px; white-space: pre-wrap;
-          user-select: text; color: var(--fg-dim); }
+#locals { padding: 4px 0; font-size: 11.5px; user-select: text; color: var(--fg); }
+#locals .empty { padding: 6px 10px; white-space: pre-wrap; color: var(--fg-dim); }
+
+/* ── 変数（A-35 で中身が見えるようになりました）── */
+.var {
+  display: flex; gap: 6px; align-items: baseline;
+  padding: 2px 10px 2px 0; font-family: var(--font-mono); font-size: 11.5px;
+  white-space: nowrap; overflow: hidden;
+}
+.var .tw { width: 10px; flex: 0 0 10px; color: var(--fg-dim); cursor: pointer; }
+.var .nm { color: var(--accent-2); }
+.var .eq { color: var(--fg-dim); }
+.var .vl { color: var(--fg); overflow: hidden; text-overflow: ellipsis; }
+.var .ty { margin-left: auto; color: var(--fg-dim); font-size: 10.5px; padding-left: 8px; }
+.var:hover { background: var(--bg-3); }
+.var.evaled .nm { color: var(--warn); }
 #eval-input { margin: 4px 6px; padding: 3px 6px; border: 1px solid var(--line);
               border-radius: 4px; background: var(--bg); color: var(--fg);
               font: 11.5px var(--font-mono); flex: 0 0 auto; }
@@ -286,3 +300,48 @@ dialog menu button.primary { background: var(--accent); border-color: var(--acce
   content: "▶"; color: var(--warn); font-size: 11px;
   display: block; text-align: center; line-height: inherit;
 }
+
+/* ── ライブラリ（読むだけ）───────────────────── */
+.side-head.lib { cursor: pointer; border-top: 1px solid var(--line); border-bottom: none; }
+.side-head.lib:hover { background: var(--bg-3); }
+.side-head.lib .tw { width: 12px; font-size: 10px; }
+#lib-tree { max-height: 40%; overflow: auto; padding-bottom: 4px; flex: 0 0 auto; }
+.lib-group { padding: 4px 8px; font-size: 10.5px; color: var(--fg-dim); }
+.node.lib .nm { color: var(--fg-dim); }
+.node.lib:hover .nm { color: var(--accent-2); }
+
+/* 読むだけのタブと、入口のタブ */
+.tab.ro .nm { font-style: italic; }
+.tab.entry .nm::before { content: "▶ "; color: var(--accent-2); font-size: 9px; }
+
+/* 入口の表示（下の帯） */
+#st-entry { cursor: pointer; }
+#st-entry:hover { color: var(--fg); }
+
+/* 変数：引数とローカルの見出し、絞り込み */
+.vargroup-head {
+  padding: 3px 10px 1px; font-size: 10px; color: var(--fg-dim);
+  font-family: var(--font-ui); letter-spacing: .04em;
+}
+#var-filter {
+  margin: 4px 6px 2px; padding: 3px 6px; border: 1px solid var(--line);
+  border-radius: 4px; background: var(--bg); color: var(--fg);
+  font: 11.5px var(--font-mono); flex: 0 0 auto;
+}
+#var-filter:disabled { opacity: .4; }
+.var .arg { color: var(--warn); }
+#frame-label { font-family: var(--font-mono); font-size: 10.5px; font-weight: 400; }
+
+/* 置けなかったブレークポイント（その行は実行ファイルに入っていません） */
+.bp.unresolved .nm { color: var(--fg-dim); }
+.bp.unresolved .fl::after { content: " ○"; color: var(--warn); }
+
+/* 行の右に薄く出す「いまの値」 */
+.ys-inline-value {
+  color: var(--fg-dim) !important;
+  font-style: italic;
+  opacity: .85;
+}
+
+/* ⏸ になっているあいだ（走っている最中）は目立たせる */
+.tb.icon.pausing { color: var(--warn); border-color: var(--warn); }

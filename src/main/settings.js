@@ -13,6 +13,10 @@ const DEFAULTS = {
   compilerPath: '',      // 空なら自動で探す
   debuggerPath: '',      // 空なら lldb / gdb を自動で探す
   lastFolder: '',        // 次の起動で開き直すフォルダ
+  // ★ フォルダごとの「入口のファイル」。複数ファイルのとき、
+  //   util.ys を見ていても建てるのは main.ys、を覚えておくところです。
+  //   { "/path/to/myapp": "/path/to/myapp/main.ys" }
+  entries: {},
   fontSize: 14,
   theme: 'dark',         // 'dark' | 'light'
   optLevel: '-O0',

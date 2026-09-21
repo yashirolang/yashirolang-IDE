@@ -39,6 +39,11 @@ module.exports = function buildMenu({ send, openDevTools }) {
         { role: 'selectAll', label: 'すべて選択' },
         { type: 'separator' },
         item('検索…', 'find', 'CmdOrCtrl+F'),
+        { type: 'separator' },
+        // ★ 定義へ移動は「見る」ではなく「編集」の隣に置きます
+        //   （VS Code / Xcode と同じ F12）。
+        item('定義へ移動', 'goto-definition', 'F12'),
+        item('戻る', 'go-back', 'Alt+Left'),
       ],
     },
     {
@@ -47,13 +52,22 @@ module.exports = function buildMenu({ send, openDevTools }) {
         item('確認（型検査）', 'check', 'CmdOrCtrl+R'),
         item('実行', 'run', 'CmdOrCtrl+Return'),
         item('停止', 'stop', 'CmdOrCtrl+.'),
+        { type: 'separator' },
+        // ★ 複数ファイルのときに「どれを建てるか」を決めるところ。
+        item('このファイルを入口にする', 'set-entry'),
+        item('入口の指定をやめる', 'clear-entry'),
       ],
     },
     {
       label: 'デバッグ',
       submenu: [
-        item('デバッグ実行', 'debug', 'F5'),
+        // ★ F5 は VS Code と同じで「始める／続ける」の 1 つです。
+        //   止まっているときに押すと続行になります。
+        item('デバッグ実行 / 続行', 'debug-or-continue', 'F5'),
         item('続行', 'continue', 'F8'),
+        // ★ 走っている最中に割り込みます（VS Code と同じ F6）。
+        item('一時停止', 'pause', 'F6'),
+        item('デバッグを止める', 'stop', 'Shift+F5'),
         { type: 'separator' },
         item('ステップオーバー', 'step-over', 'F10'),
         item('ステップイン', 'step-into', 'F11'),

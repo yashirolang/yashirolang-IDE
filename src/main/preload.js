@@ -21,7 +21,10 @@ contextBridge.exposeInMainWorld('ide', {
   },
   fs: {
     tree: (dir) => invoke('fs:tree', dir),
-    read: (p) => invoke('fs:read', p),
+    // 読むだけ（標準ライブラリと deps の中も開けます）
+    open: (p) => invoke('fs:open', p),
+    library: () => invoke('fs:library'),
+    entries: () => invoke('fs:entries'),
     write: (p, c) => invoke('fs:write', p, c),
     createFile: (dir, name) => invoke('fs:createFile', dir, name),
     createFolder: (dir, name) => invoke('fs:createFolder', dir, name),
@@ -39,8 +42,15 @@ contextBridge.exposeInMainWorld('ide', {
     stdin: (data) => invoke('run:stdin', data),
     stop: () => invoke('run:stop'),
   },
+  // 名前の表（定義へ移動・型の表示）
+  symbols: {
+    definition: (file, text, line, character) => invoke('symbols:definition', file, text, line, character),
+    hover: (file, text, line, character) => invoke('symbols:hover', file, text, line, character),
+    outline: (file, text) => invoke('symbols:outline', file, text),
+  },
   debug: {
     start: (src, breakpoints) => invoke('debug:start', src, breakpoints),
+    selectFrame: (index) => invoke('debug:selectFrame', index),
     resume: () => invoke('debug:cmd', 'continue'),
     stepOver: () => invoke('debug:cmd', 'stepOver'),
     stepInto: () => invoke('debug:cmd', 'stepInto'),
@@ -49,6 +59,7 @@ contextBridge.exposeInMainWorld('ide', {
     stop: () => invoke('debug:stop'),
     addBreakpoint: (file, line) => invoke('debug:addBreakpoint', file, line),
     evaluate: (expr) => invoke('debug:evaluate', expr),
+    expand: (expr) => invoke('debug:expand', expr),
     stdin: (data) => invoke('debug:stdin', data),
   },
   on: (channel, fn) => {

@@ -7,17 +7,24 @@
 const S = {
   settings: null,
   root: '',                 // 開いているフォルダ
-  tabs: new Map(),          // path -> { model, viewState, dirty }
+  tabs: new Map(),          // path -> { model, viewState, dirty, readonly }
   active: null,             // いま表示しているファイルのパス
   breakpoints: new Map(),   // path -> Set<line>
+  bpState: new Map(),       // "path:line" -> true/false（デバッガが置けたか）
   mode: 'idle',             // idle | building | running | dbg-run | dbg-pause
   frames: [],
+  frameIndex: 0,            // 呼び出し履歴のどの枠を見ているか
+  vars: [],
+  varFilter: '',
   expanded: new Set(),      // 開いている枝
+  history: [],              // 定義へ移動する前の場所（戻る用）
+  entry: '',                // 入口のファイル（複数ファイルのとき建てるもの）
 };
 
 let editor = null;
 let monacoRef = null;
 let decorations = null;     // ブレークポイントと現在行
+let inlineValues = null;    // 行の右に出す「いまの値」
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
@@ -76,21 +83,224 @@ function createEditor() {
     contextmenu: true,
   });
   decorations = editor.createDecorationsCollection();
+  inlineValues = editor.createDecorationsCollection();
 
   editor.onDidChangeCursorPosition((e) => {
     $('st-pos').textContent = `${e.position.lineNumber}:${e.position.column}`;
   });
 
+  // 下の帯の「入口: …」を押すと、そのファイルを入口にできます。
+  $('st-entry').onclick = () => {
+    const p = currentYs();
+    if (!p) return;
+    setEntry(S.entry === p ? '' : p);
+  };
+
   // 行番号の左をクリック → ブレークポイントの付け外し
+  // ⌘（Windows / Linux は Ctrl）＋クリック → 定義へ移動
   editor.onMouseDown((e) => {
     const T = monacoRef.editor.MouseTargetType;
     if (e.target.type === T.GUTTER_GLYPH_MARGIN && S.active) {
       toggleBreakpoint(S.active, e.target.position.lineNumber);
+      return;
+    }
+    const mod = e.event.metaKey || e.event.ctrlKey;
+    if (mod && e.target.position && e.target.type === T.CONTENT_TEXT) {
+      e.event.preventDefault();
+      gotoDefinition(e.target.position);
     }
   });
 
   editor.addCommand(monacoRef.KeyCode.F9, () => {
     if (S.active) toggleBreakpoint(S.active, editor.getPosition().lineNumber);
+  });
+
+  wireNavigation();
+  wireDebugKeys();
+}
+
+/* ────────────────────────────────────────────────────────
+   定義へ移動 と、名前の上に出す説明
+   ──────────────────────────────────────────────────────── */
+
+// Monaco に「定義はここに訊いてください」と教えます。
+// 答えを出すのは main 側（symbols.js）＝ コンパイラの `--dump-tokens` です。
+function wireNavigation() {
+  monacoRef.languages.registerDefinitionProvider(YS_LANGUAGE_ID, {
+    provideDefinition: async (model, position) => {
+      const file = pathOf(model);
+      if (!file) return null;
+      const d = await call(window.ide.symbols.definition, file, model.getValue(),
+                           position.lineNumber - 1, position.column - 1);
+      if (!d) return null;
+      // ★ 行き先が別のファイルなら、中身を先に用意します
+      //   （用意しないと Monaco は何も出せません）。
+      const target = await ensureModel(d.file);
+      if (!target) return null;
+      return {
+        uri: target.uri,
+        range: new monacoRef.Range(d.line, d.column, d.line, d.column + (d.length || 1)),
+      };
+    },
+  });
+
+  // ★ 別のファイルへ飛ぶときは、こちらでタブを開きます。
+  //   （Monaco 単体には「別のファイルを開く」係がいません。）
+  //
+  // ⚠️ Monaco の配布物によっては「定義へ移動」そのもの
+  //   （editor.action.revealDefinition）が**入っていません**
+  //   （0.56 の min ビルドには入っていませんでした）。
+  //   だから F12 と ⌘＋クリックは、上の登録に頼らず
+  //   **こちらで用意しています**（editor.addAction と onMouseDown）。
+  //   登録のほうは、入っている版でピーク（覗き見）が出せるように残します。
+  const svc = editor._codeEditorService;
+  if (svc && typeof svc.openCodeEditor === 'function') {
+    svc.openCodeEditor = async (input, source) => {
+      const target = input.resource && (input.resource.fsPath || input.resource.path);
+      if (!target) return source || editor;
+      const sel = input.options && input.options.selection;
+      remember();
+      await gotoLocation(target, sel ? sel.startLineNumber : 1, sel ? sel.startColumn : 1);
+      return editor;
+    };
+  }
+
+  // F12（メニューと同じ）。上の仕掛けが無い版でも、これだけで飛べます。
+  editor.addAction({
+    id: 'ys.gotoDefinition',
+    label: '定義へ移動',
+    keybindings: [monacoRef.KeyCode.F12],
+    contextMenuGroupId: 'navigation',
+    contextMenuOrder: 1,
+    run: () => gotoDefinition(),
+  });
+  editor.addAction({
+    id: 'ys.goBack',
+    label: '戻る',
+    keybindings: [monacoRef.KeyMod.Alt | monacoRef.KeyCode.LeftArrow],
+    contextMenuGroupId: 'navigation',
+    contextMenuOrder: 2,
+    run: () => goBack(),
+  });
+
+  // 名前の上に出す説明。止まっているときは**いまの値**も出します。
+  monacoRef.languages.registerHoverProvider(YS_LANGUAGE_ID, {
+    provideHover: async (model, position) => {
+      const file = pathOf(model);
+      if (!file) return null;
+      const parts = [];
+
+      const value = await hoverValue(model, position);
+      if (value) parts.push({ value });
+
+      const info = await call(window.ide.symbols.hover, file, model.getValue(),
+                              position.lineNumber - 1, position.column - 1);
+      if (info && info.markdown) parts.push({ value: info.markdown });
+      if (!parts.length) return null;
+      return { contents: parts };
+    },
+  });
+}
+
+function pathOf(model) {
+  return model && model.uri ? (model.uri.fsPath || model.uri.path) : null;
+}
+
+// 止まっているとき、カーソルの下の変数の値を読む。
+//
+// ⚠️ 読むのは **名前と `.` だけでできた式**に限ります（`xs[i]` や `f()` は
+//   読みません）。式を評価すると関数が動いてしまい、見ただけのつもりが
+//   プログラムの状態を変えてしまうからです。
+async function hoverValue(model, position) {
+  if (S.mode !== 'dbg-pause') return '';
+  const expr = dottedWordAt(model, position);
+  if (!expr) return '';
+  const known = S.vars.find((v) => v.name === expr);
+  if (known) return '`' + expr + '` = **' + known.value + '**' + (known.type ? '  _' + known.type + '_' : '');
+  const out = await call(window.ide.debug.evaluate, expr);
+  const line = String(out || '').trim().split('\n').pop();
+  if (!line || /error:|no variable|No symbol/i.test(line)) return '';
+  return '`' + expr + '` = **' + line.replace(/^\(.*?\)\s*\$\d+\s*=\s*/, '') + '**';
+}
+
+// カーソルの下の `a.b.c`（名前と `.` だけ）
+function dottedWordAt(model, position) {
+  const word = model.getWordAtPosition(position);
+  if (!word) return '';
+  const before = model.getValueInRange({
+    startLineNumber: position.lineNumber, startColumn: 1,
+    endLineNumber: position.lineNumber, endColumn: word.startColumn,
+  });
+  const head = /([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.)$/.exec(before);
+  const after = model.getValueInRange({
+    startLineNumber: position.lineNumber, startColumn: word.endColumn,
+    endLineNumber: position.lineNumber, endColumn: word.endColumn + 1,
+  });
+  if (after === '(') return '';           // 関数呼び出しは読みません
+  return (head ? head[1] : '') + word.word;
+}
+
+// いまの場所を覚えてから飛ぶ（Alt+← で戻れます）
+function remember() {
+  if (!S.active || !editor) return;
+  const pos = editor.getPosition();
+  S.history.push({ file: S.active, line: pos.lineNumber, column: pos.column });
+  if (S.history.length > 50) S.history.shift();
+}
+
+async function gotoDefinition(position) {
+  if (!S.active || !editor) return;
+  if (!position && twice('goto-definition')) return;
+  const pos = position || editor.getPosition();
+  const d = await call(window.ide.symbols.definition, S.active, editor.getModel().getValue(),
+                       pos.lineNumber - 1, pos.column - 1);
+  if (!d) {
+    writeConsole('info', '定義が分かりませんでした（式の型が要る名前は追えません）。\n');
+    return;
+  }
+  remember();
+  await gotoLocation(d.file, d.line, d.column);
+}
+
+async function goBack() {
+  if (twice('go-back')) return;
+  const back = S.history.pop();
+  if (!back) return;
+  await gotoLocation(back.file, back.line, back.column);
+}
+
+/* ────────────────────────────────────────────────────────
+   デバッグのキー（F5 / F8 / F10 / F11 / ⇧F11）
+   ──────────────────────────────────────────────────────── */
+//
+// ★ メニューにも同じキーを付けてあります。どちらから来ても
+//   通り道は 1 本（dbg / doDebug）で、**二重に進まない**ように
+//   「返事待ちのあいだは受け取らない」で守っています。
+function wireDebugKeys() {
+  const K = monacoRef.KeyCode;
+  const M = monacoRef.KeyMod;
+  const bind = (keys, fn) => editor.addCommand(keys, fn);
+  bind(K.F5, () => debugOrContinue());
+  bind(M.Shift | K.F5, () => doStop());
+  bind(K.F6, () => doPause());
+  bind(K.F8, () => dbg('resume'));
+  bind(K.F10, () => dbg('stepOver'));
+  bind(K.F11, () => dbg('stepInto'));
+  bind(M.Shift | K.F11, () => dbg('stepOut'));
+
+  // エディタの外（木・出力欄）にカーソルがあるときも同じキーで動かせます。
+  window.addEventListener('keydown', (e) => {
+    if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+    const map = {
+      F5: () => (e.shiftKey ? doStop() : debugOrContinue()),
+      F6: () => doPause(),
+      F8: () => dbg('resume'),
+      F10: () => dbg('stepOver'),
+      F11: () => (e.shiftKey ? dbg('stepOut') : dbg('stepInto')),
+    };
+    if (!map[e.key]) return;
+    e.preventDefault();
+    map[e.key]();
   });
 }
 
@@ -109,9 +319,17 @@ async function boot() {
 
   refreshToolchain();
 
+  wireLibrary();
+
   // 自己点検（test/smoke.js）から画面の中を覗くための窓口。
   // ここから触れるのは画面の関数だけで、ファイルや OS には届きません。
-  window.__ide = { S, get editor() { return editor; }, toggleBreakpoint, openFile, doCheck, doRun, doDebug, doStop, dbg };
+  window.__ide = {
+    S, get editor() { return editor; },
+    toggleBreakpoint, openFile, doCheck, doRun, doDebug, doStop, dbg,
+    gotoDefinition, goBack, selectFrame, setEntry, targetFile, debugOrContinue, doPause,
+    // 名前の上に出す「いまの値」を、点検から確かめるための入口
+    hoverAt: (lineNumber, column) => hoverValue(editor.getModel(), { lineNumber, column }),
+  };
 
   // 前に開いていたフォルダがあれば、そのまま開き直します。
   if (S.settings.lastFolder) {
@@ -140,6 +358,10 @@ async function refreshToolchain() {
    ──────────────────────────────────────────────────────── */
 function setRoot(root, items) {
   S.root = root;
+  // ★ 入口はフォルダごとに覚えています。
+  S.entry = (S.settings.entries || {})[root] || '';
+  renderEntry();
+  loadLibrary();
   $('root-name').textContent = base(root);
   $('root-name').title = root;
   const tree = $('tree');
@@ -240,6 +462,50 @@ function wireTree() {
   });
 }
 
+/* ── ライブラリ（読むだけ）────────────────────────
+ *
+ * ★ `import strings` と書いたときに読まれる物が、そのまま並びます。
+ *   置き場所は処理系に訊いています（`--print-lib-dir`）。
+ *   ysm を使っている木なら `deps/` も出ます。
+ */
+async function wireLibrary() {
+  const head = $('lib-head');
+  const box = $('lib-tree');
+  head.onclick = async () => {
+    const open = box.style.display !== 'none';
+    box.style.display = open ? 'none' : '';
+    head.querySelector('.tw').textContent = open ? '▸' : '▾';
+    if (!open) await loadLibrary();
+  };
+}
+
+async function loadLibrary() {
+  const box = $('lib-tree');
+  box.innerHTML = '';
+  const groups = await call(window.ide.fs.library);
+  if (!groups || !groups.length) {
+    box.append(Object.assign(el('div', 'empty small'),
+      { textContent: 'コンパイラが見つからないので、ライブラリの場所が分かりません。' }));
+    return;
+  }
+  for (const g of groups) {
+    const head = el('div', 'lib-group', g.name);
+    head.title = g.dir;
+    box.append(head);
+    for (const it of g.items) {
+      if (it.dir) continue;
+      if (!isYs(it.path)) continue;
+      const node = el('div', 'node ys lib');
+      node.style.paddingLeft = '21px';
+      node.append(el('span', 'tw', ''), el('span', 'ic', '◆'),
+                  el('span', 'nm', it.name.replace(/\.ys$/, '')));
+      node.title = it.path;
+      node.onclick = () => openFile(it.path);
+      box.append(node);
+    }
+  }
+}
+
 async function openFolder() {
   const r = await call(window.ide.dialog.openFolder);
   if (!r) return;
@@ -290,17 +556,31 @@ function askName(title, value, okLabel) {
 /* ────────────────────────────────────────────────────────
    タブとエディタ
    ──────────────────────────────────────────────────────── */
+// ★ 開く先は「開いているフォルダの中」だけではありません。
+//   import した先で止まったときや、定義へ移動で標準ライブラリへ飛んだときは、
+//   **読むだけ**のタブとして開きます（🔒 が付きます）。
 async function openFile(p) {
   if (S.tabs.has(p)) return activateTab(p);
-  const text = await call(window.ide.fs.read, p);
-  if (text === null) return;
+  const opened = await call(window.ide.fs.open, p);
+  if (!opened) return;
   const uri = monacoRef.Uri.file(p);
   const model = monacoRef.editor.getModel(uri)
-    || monacoRef.editor.createModel(text, isYs(p) ? YS_LANGUAGE_ID : undefined, uri);
+    || monacoRef.editor.createModel(opened.text, isYs(p) ? YS_LANGUAGE_ID : undefined, uri);
   model.onDidChangeContent(() => markDirty(p, true));
-  S.tabs.set(p, { model, viewState: null, dirty: false });
+  S.tabs.set(p, { model, viewState: null, dirty: false, readonly: !!opened.readonly });
   renderTabs();
   activateTab(p);
+}
+
+// Monaco の「定義へ移動」は行き先のモデルを先に要ります。
+// タブにはしないで、中身だけ用意しておきます。
+async function ensureModel(p) {
+  const uri = monacoRef.Uri.file(p);
+  const has = monacoRef.editor.getModel(uri);
+  if (has) return has;
+  const opened = await call(window.ide.fs.open, p);
+  if (!opened) return null;
+  return monacoRef.editor.createModel(opened.text, isYs(p) ? YS_LANGUAGE_ID : undefined, uri);
 }
 
 function activateTab(p) {
@@ -309,12 +589,15 @@ function activateTab(p) {
   if (S.active && S.tabs.has(S.active)) S.tabs.get(S.active).viewState = editor.saveViewState();
   S.active = p;
   editor.setModel(tab.model);
+  editor.updateOptions({ readOnly: !!tab.readonly });
   if (tab.viewState) editor.restoreViewState(tab.viewState);
   editor.focus();
   $('editor-empty').style.display = 'none';
-  $('st-file').textContent = p;
+  $('st-file').textContent = p + (tab.readonly ? '（読むだけ）' : '');
+  renderEntry();
   renderTabs();
   paintDecorations();
+  paintInlineValues();
 }
 
 function markDirty(p, dirty) {
@@ -328,9 +611,10 @@ function renderTabs() {
   const bar = $('tabs');
   bar.innerHTML = '';
   for (const [p, t] of S.tabs) {
-    const tab = el('div', 'tab' + (p === S.active ? ' active' : '') + (t.dirty ? ' dirty' : ''));
-    tab.title = p;
-    tab.append(el('span', 'nm', base(p)));
+    const tab = el('div', 'tab' + (p === S.active ? ' active' : '') + (t.dirty ? ' dirty' : '')
+                   + (t.readonly ? ' ro' : '') + (p === S.entry ? ' entry' : ''));
+    tab.title = p + (t.readonly ? '\n（開いているフォルダの外なので、読むだけです）' : '');
+    tab.append(el('span', 'nm', (t.readonly ? '🔒 ' : '') + base(p)));
     const x = el('span', 'x', '×');
     x.onclick = (e) => { e.stopPropagation(); closeTab(p); };
     tab.append(x);
@@ -377,6 +661,11 @@ function renameTab(oldPath, newPath) {
 async function saveFile(p) {
   const t = S.tabs.get(p);
   if (!t) return false;
+  // ⚠️ 標準ライブラリなどは読むだけです。黙って捨てずに、そう言います。
+  if (t.readonly) {
+    toast(`${base(p)} は開いているフォルダの外にあるので保存できません。`);
+    return false;
+  }
   const ok = await call(window.ide.fs.write, p, t.model.getValue());
   if (ok) markDirty(p, false);
   return !!ok;
@@ -396,11 +685,21 @@ function bpSet(p) {
 
 function toggleBreakpoint(p, line) {
   const set = bpSet(p);
-  if (set.has(line)) set.delete(line);
-  else {
+  if (set.has(line)) {
+    set.delete(line);
+    S.bpState.delete(p + ':' + line);
+  } else {
     set.add(line);
     // デバッグ中なら、その場で足します。
-    if (S.mode.startsWith('dbg')) window.ide.debug.addBreakpoint(p, line);
+    // ★ 置けたかどうか（その行が実行ファイルに入っているか）を持ち帰ります。
+    if (S.mode.startsWith('dbg')) {
+      call(window.ide.debug.addBreakpoint, p, line).then((st) => {
+        if (st && typeof st === 'object') {
+          S.bpState.set(p + ':' + line, st.resolved);
+          renderBreakpointList();
+        }
+      });
+    }
   }
   paintDecorations();
   renderBreakpointList();
@@ -432,6 +731,60 @@ function paintDecorations() {
   decorations.set(list);
 }
 
+/* ── 行の右に出す「いまの値」───────────────────────
+ *
+ * ★ 止まっている関数の中だけ、変数の**いまの値**を行の右に薄く出します。
+ *   マウスを当てなくても、目で追えるようにするためです。
+ *
+ * ⚠️ 出すのは「その行で名前が出てくる変数」だけです。全部出すと、
+ *   関係ない行まで埋まって読めなくなります。
+ */
+function paintInlineValues() {
+  if (!editor || !inlineValues) return;
+  // ⚠️ 止まった行が分からないとき（系統の奥で止まったとき）は、
+  //   何も出しません。当てずっぽうの行に値を並べないためです。
+  if (S.mode !== 'dbg-pause' || !S.stopAt || !S.stopAt.line
+      || S.stopAt.file !== S.active || !S.vars.length) {
+    inlineValues.clear();
+    return;
+  }
+  const model = editor.getModel();
+  if (!model) return;
+
+  const stopLine = S.stopAt.line;
+  const from = functionStart(model, stopLine);
+  const list = [];
+  for (let line = from; line <= Math.min(stopLine, model.getLineCount()); line++) {
+    const text = model.getLineContent(line);
+    const here = [];
+    for (const v of S.vars) {
+      if (new RegExp('\\b' + v.name + '\\b').test(text)) here.push(`${v.name} = ${short(v.value)}`);
+    }
+    if (!here.length) continue;
+    list.push({
+      range: new monacoRef.Range(line, model.getLineMaxColumn(line), line, model.getLineMaxColumn(line)),
+      options: {
+        after: { content: '   ' + here.join(', '), inlineClassName: 'ys-inline-value' },
+        showIfCollapsed: true,
+      },
+    });
+  }
+  inlineValues.set(list);
+}
+
+// 止まっている行から上へたどって、その関数の始まりを探す。
+function functionStart(model, line) {
+  for (let n = line; n >= 1; n--) {
+    if (/^\s*def\s/.test(model.getLineContent(n))) return n;
+  }
+  return 1;
+}
+
+function short(v) {
+  const s = String(v == null ? '' : v);
+  return s.length > 40 ? s.slice(0, 39) + '…' : s;
+}
+
 function renderBreakpointList() {
   const box = $('bplist');
   box.innerHTML = '';
@@ -439,7 +792,10 @@ function renderBreakpointList() {
   for (const [p, set] of S.breakpoints) {
     for (const line of [...set].sort((a, b) => a - b)) {
       n++;
-      const row = el('div', 'bp');
+      const placed = S.bpState.get(p + ':' + line);
+      const row = el('div', 'bp' + (placed === false ? ' unresolved' : ''));
+      if (placed === false) row.title = 'この行は実行ファイルに入っていません'
+        + '（入口から import されていないファイルです）。';
       row.append(el('span', 'nm', base(p)), el('span', 'fl', `:${line}`));
       const rm = el('span', 'rm', '×');
       rm.onclick = (e) => { e.stopPropagation(); toggleBreakpoint(p, line); };
@@ -474,25 +830,83 @@ function wireToolbar() {
   $('btn-run').onclick = doRun;
   $('btn-stop').onclick = doStop;
   $('btn-debug').onclick = doDebug;
-  $('btn-continue').onclick = () => dbg('resume');
+  // ★ 1 つのボタンが 2 役です。走っている間は ⏸（一時停止）、
+  //   止まっている間は ⏵（続行）。VS Code と同じ並びにしています。
+  $('btn-continue').onclick = () => (S.mode === 'dbg-run' ? doPause() : dbg('resume'));
   $('btn-step-over').onclick = () => dbg('stepOver');
   $('btn-step-into').onclick = () => dbg('stepInto');
   $('btn-step-out').onclick = () => dbg('stepOut');
   $('btn-settings').onclick = openSettings;
 }
 
-// 「いまビルドすべきファイル」＝ 開いている .ys。
-// .ys 以外を見ているときは、最後に触った .ys を使います。
+// 「いまビルドすべきファイル」。
+//
+// ★ 複数ファイルのときは **入口（`def main()` のあるファイル）**を建てます。
+//   util.ys を開いたまま ▶ を押しても、建つのは main.ys です。
+//   （処理系は入口から import をたどって、まとめて 1 つの実行ファイルにします。）
+//
+// 決め方は次の順です。
+//   ① 「このファイルを入口にする」で指定したもの（フォルダごとに覚えます）
+//   ② いま開いている .ys に `def main(` があれば、それ
+//   ③ フォルダの中で `def main(` があるのが 1 つだけなら、それ
+//   ④ それ以外は、いま開いている .ys
 let lastYs = null;
-function targetFile() {
+
+function currentYs() {
   if (isYs(S.active)) { lastYs = S.active; return S.active; }
   if (lastYs && S.tabs.has(lastYs)) return lastYs;
   for (const p of S.tabs.keys()) if (isYs(p)) return p;
   return null;
 }
 
+function hasMain(p) {
+  const t = S.tabs.get(p);
+  return !!(t && /^\s*def\s+main\s*\(/m.test(t.model.getValue()));
+}
+
+async function targetFile() {
+  if (S.entry) return S.entry;
+  const here = currentYs();
+  if (!here) return null;
+  if (hasMain(here)) return here;
+
+  // 開いていないファイルのことは main 側に訊きます（木を 1 回だけ歩きます）。
+  const found = await call(window.ide.fs.entries);
+  if (found && found.length === 1 && found[0] !== here) {
+    writeConsole('info', `入口は ${base(found[0])} です（${base(here)} に def main() がないため）。\n`);
+    return found[0];
+  }
+  if (found && found.length > 1 && !found.includes(here)) {
+    writeConsole('info',
+      `def main() のあるファイルが ${found.length} 個あります。`
+      + '「スケッチ → このファイルを入口にする」で決められます:\n'
+      + found.map((f) => '    ' + base(f)).join('\n') + '\n');
+  }
+  return here;
+}
+
+function setEntry(p) {
+  S.entry = p || '';
+  const entries = { ...(S.settings.entries || {}) };
+  if (S.root) {
+    if (p) entries[S.root] = p;
+    else delete entries[S.root];
+    S.settings = { ...S.settings, entries };
+    window.ide.settings.set({ entries });
+  }
+  renderEntry();
+  renderTabs();
+}
+
+function renderEntry() {
+  const box = $('st-entry');
+  const shown = S.entry || currentYs();
+  box.textContent = shown ? `入口: ${base(shown)}${S.entry ? '' : '（自動）'}` : '';
+  box.title = shown ? shown : '';
+}
+
 async function prepare() {
-  const src = targetFile();
+  const src = await targetFile();
   if (!src) { toast('.ys のファイルを開いてください。'); return null; }
   if (S.settings.autoSaveBeforeBuild) await saveAll();
   clearProblems();
@@ -510,7 +924,8 @@ async function doCheck() {
 }
 
 async function doRun() {
-  if (S.mode === 'running') return;
+  if (S.mode === 'running' || S.mode === 'building') return;
+  if (twice('run')) return;
   const src = await prepare();
   if (!src) return;
   setMode('building');
@@ -521,7 +936,8 @@ async function doRun() {
 }
 
 async function doDebug() {
-  if (S.mode.startsWith('dbg')) return;
+  if (S.mode.startsWith('dbg') || S.mode === 'building') return;
+  if (twice('debug')) return;
   const src = await prepare();
   if (!src) return;
   setMode('building');
@@ -541,16 +957,62 @@ async function doStop() {
   setMode('idle');
 }
 
+// ★ キーは「メニュー」と「エディタ」の 2 か所から来ます。
+//   同じ指示が 2 回届いても **2 歩進まない**ように、
+//   返事が返るまでは次を受け取りません。
+let dbgBusy = false;
+
+// 同じ指示が続けて 2 回来たときの二重起動よけ（キーは両方から届きます）。
+const lastFired = new Map();
+function twice(key, ms = 400) {
+  const now = Date.now();
+  const at = lastFired.get(key) || 0;
+  lastFired.set(key, now);
+  return now - at < ms;
+}
+
 async function dbg(cmd) {
   if (!S.mode.startsWith('dbg')) return;
+  if (S.mode !== 'dbg-pause') return;      // 走っている間は受け取りません
+  if (dbgBusy) return;
+  dbgBusy = true;
   setMode('dbg-run');
-  await call(window.ide.debug[cmd]);
+  try {
+    await call(window.ide.debug[cmd]);
+  } finally {
+    dbgBusy = false;
+  }
+}
+
+// ⏸ 一時停止。走っている対象に割り込んで、いまいる行で止めます。
+//
+// ★ 止まったことは 'stopped' の知らせで届きます（ブレークポイントで
+//   止まったときと同じ道）。ここでは送るだけです。
+async function doPause() {
+  if (S.mode !== 'dbg-run') return;
+  if (twice('pause')) return;
+  const ok = await call(window.ide.debug.pause);
+  if (ok === false) {
+    writeConsole('info',
+      '一時停止できませんでした（対象がもう終わっているか、この環境では割り込めません）。\n');
+  }
+}
+
+// F5 …… 止まっているなら続行、そうでなければデバッグ実行を始める。
+function debugOrContinue() {
+  if (S.mode === 'dbg-pause') return dbg('resume');
+  if (S.mode.startsWith('dbg') || S.mode === 'building') return;
+  return doDebug();
 }
 
 /* ────────────────────────────────────────────────────────
    画面の状態（ボタンの有効・無効）
    ──────────────────────────────────────────────────────── */
 function setMode(mode) {
+  // ⚠️ 二重配達よけ（twice）は、**状態が変わったら忘れます**。
+  //   「止める → 続ける → また止める」を続けて押したとき、
+  //   2 回目を「二重配達」と間違えて捨てないためです。
+  if (S.mode !== mode) lastFired.clear();
   S.mode = mode;
   const dbgOn = mode === 'dbg-pause';
   const busy = mode === 'building';
@@ -560,9 +1022,17 @@ function setMode(mode) {
   $('btn-run').disabled = busy || live;
   $('btn-debug').disabled = busy || live;
   $('btn-stop').disabled = !(busy || live);
-  for (const id of ['btn-continue', 'btn-step-over', 'btn-step-into', 'btn-step-out']) {
+  for (const id of ['btn-step-over', 'btn-step-into', 'btn-step-out']) {
     $(id).disabled = !dbgOn;
   }
+
+  // ⏵ / ⏸ の 1 つのボタン。走っている間だけ ⏸ になります。
+  const cont = $('btn-continue');
+  const pausing = mode === 'dbg-run';
+  cont.textContent = pausing ? '⏸' : '⏵';
+  cont.title = pausing ? '一時停止（F6）' : '続行（F8）';
+  cont.classList.toggle('pausing', pausing);
+  cont.disabled = !(dbgOn || pausing);
   $('stdin').disabled = !live;
   $('eval-input').disabled = !dbgOn;
 
@@ -576,8 +1046,13 @@ function setMode(mode) {
 
   if (mode === 'idle') {
     S.stopAt = null;
+    S.frameIndex = 0;
+    $('frame-label').textContent = '';
     paintDecorations();
+    if (inlineValues) inlineValues.clear();
   }
+  $('var-filter').disabled = !dbgOn;
+  if (mode !== 'dbg-pause' && inlineValues) inlineValues.clear();
 }
 
 /* ────────────────────────────────────────────────────────
@@ -598,12 +1073,23 @@ function wirePanel() {
     else window.ide.run.stdin(line);
   });
 
+  $('var-filter').addEventListener('input', (e) => {
+    S.varFilter = e.target.value;
+    renderVars();
+  });
+
   $('eval-input').addEventListener('keydown', async (e) => {
     if (e.key !== 'Enter') return;
     const expr = e.target.value.trim();
     if (!expr) return;
     const out = await call(window.ide.debug.evaluate, expr);
-    $('locals').textContent = `${expr}\n${out || ''}\n\n` + $('locals').textContent;
+    const row = el('div', 'var evaled');
+    row.append(el('span', 'tw', ' '));
+    row.append(el('span', 'nm', expr));
+    row.append(el('span', 'eq', '='));
+    row.append(el('span', 'vl', String(out || '').trim().split('\n').pop()));
+    $('locals').prepend(row);
+    e.target.value = '';
   });
 
   // 仕切りをドラッグして幅と高さを変える
@@ -682,8 +1168,12 @@ function showProblems(diags) {
   if (diags.length) switchPanel('problems');
 }
 
-// エディタの中にも波線を出す
-function applyMarkers(diags) {
+// エディタの中にも波線を出す。
+//
+// ★ import した先のエラーは、**まだ開いていないファイル**に出ます。
+//   そのファイルの中身を先に用意して、開いたときにはもう波線が
+//   出ているようにします（開いてから出ると、見落とすからです）。
+async function applyMarkers(diags) {
   if (!monacoRef) return;
   const byFile = new Map();
   for (const d of diags) {
@@ -698,6 +1188,10 @@ function applyMarkers(diags) {
       endLineNumber: d.line, endColumn: (d.column || 1) + (d.label ? 3 : 1),
     });
   }
+  // まだ無いファイルの中身を用意する（エラーの出ているファイルだけ）
+  for (const p of byFile.keys()) {
+    if (!monacoRef.editor.getModel(monacoRef.Uri.file(p))) await ensureModel(p);
+  }
   for (const model of monacoRef.editor.getModels()) {
     const p = model.uri.fsPath || model.uri.path;
     monacoRef.editor.setModelMarkers(model, 'yashirolang', byFile.get(p) || []);
@@ -706,13 +1200,100 @@ function applyMarkers(diags) {
 
 // いまの yashirolang は -g で **行の情報だけ** を出します（変数の DWARF はまだ）。
 // デバッガの生のエラーをそのまま見せると戸惑うので、言い換えます。
-function explainLocals(text) {
-  if (!text || !text.trim()) return '（変数の情報はありません）';
-  if (/no variable information|No symbol table info/i.test(text)) {
-    return '変数の一覧は出せません。\n'
-      + 'いまのコンパイラは -g で行の情報だけを出すため、\n'
-      + 'デバッガから変数名を引けません。\n'
-      + '値を見たいところでは print(str(x)) を挟んでください。';
+/* ── 変数 ───────────────────────────────────────
+ *
+ * ★ 言語側が 0.28.0（A-35）から変数の名前と型を出すので、
+ *   ここに中身が並びます。list とクラスと rc は **開けます**。
+ *
+ * ⚠️ 開けなかったとき（古いコンパイラ・最適化つき）は、デバッガが返した
+ *   生の文字列をそのまま出します。**黙って空にはしません。**
+ */
+function showVars(vars, rawText) {
+  S.vars = vars || [];
+  renderVars(rawText);
+}
+
+// ★ 引数とローカル変数を分けて並べます（どれが渡ってきた物かが
+//   分かると、呼び出し側を疑うか中を疑うかが決められます）。
+function renderVars(rawText) {
+  const box = $('locals');
+  box.innerHTML = '';
+
+  if (!S.vars.length) {
+    const why = explainNoVars(rawText === undefined ? S.varsRaw : rawText);
+    box.append(Object.assign(el('div', 'empty small'), { textContent: why }));
+    return;
+  }
+  if (rawText !== undefined) S.varsRaw = rawText;
+
+  const needle = S.varFilter.trim().toLowerCase();
+  const shown = needle
+    ? S.vars.filter((v) => v.name.toLowerCase().includes(needle))
+    : S.vars;
+
+  const groups = [
+    ['引数', shown.filter((v) => v.arg)],
+    ['ローカル変数', shown.filter((v) => !v.arg)],
+  ];
+  for (const [title, list] of groups) {
+    if (!list.length) continue;
+    box.append(el('div', 'vargroup-head', title));
+    for (const v of list) box.append(varRow(v, v.name, 0));
+  }
+  if (!shown.length) {
+    box.append(Object.assign(el('div', 'empty small'),
+                             { textContent: `「${S.varFilter}」に合う変数はありません。` }));
+  }
+}
+
+function varRow(v, expr, depth) {
+  const row = el('div', 'var');
+  row.style.paddingLeft = (10 + depth * 14) + 'px';
+
+  const twisty = el('span', 'tw', v.openable ? '▸' : ' ');
+  row.append(twisty);
+  row.append(el('span', 'nm', v.name));
+  row.append(el('span', 'eq', '='));
+  row.append(el('span', 'vl', v.value));
+  if (v.type) row.append(el('span', 'ty', v.type));
+
+  if (!v.openable) return row;
+
+  const wrap = el('div', 'vargroup');
+  wrap.append(row);
+  let open = false;
+  let loaded = false;
+  row.onclick = async () => {
+    open = !open;
+    twisty.textContent = open ? '▾' : '▸';
+    if (!open) {
+      while (wrap.children.length > 1) wrap.lastChild.remove();
+      return;
+    }
+    if (!loaded) {
+      const kids = await call(window.ide.debug.expand, expr);
+      loaded = true;
+      wrap.__kids = kids || [];
+    }
+    for (const k of (wrap.__kids || [])) {
+      // ⚠️ 開いた先をさらに開くときの式は `expr->name` です
+      //   （どちらのデバッガもポインタ越しのフィールドをこの形で読みます）。
+      wrap.append(varRow(k, expr + '->' + k.name, depth + 1));
+    }
+    if (!(wrap.__kids || []).length) {
+      wrap.append(Object.assign(el('div', 'empty small'),
+                                { textContent: '（中身を読めませんでした）' }));
+    }
+  };
+  return wrap;
+}
+
+function explainNoVars(text) {
+  if (!text || !text.trim()) return 'デバッグしていません。';
+  if (/no variable information|No symbol table info|No locals/i.test(text)) {
+    return '変数の一覧が出せません。\n'
+      + 'コンパイラが 0.27.0 以前か、最適化つきで建てています。\n'
+      + '（変数のデバッグ情報は 0.28.0 から。デバッグ実行は -O0 です）';
   }
   return text;
 }
@@ -727,12 +1308,37 @@ function showFrames(frames) {
     return;
   }
   for (const f of S.frames) {
-    const row = el('div', 'frame' + (f.index === 0 ? ' current' : ''));
+    const row = el('div', 'frame' + (f.index === S.frameIndex ? ' current' : ''));
     row.append(el('span', 'nm', `#${f.index} ${f.func}`));
     if (f.file) row.append(el('span', 'fl', `${base(f.file)}:${f.line}`));
-    row.onclick = () => gotoLocation(f.file, f.line);
+    // ★ 押すと、その枠の変数に切り替わります（呼び出した側の変数が見えます）。
+    row.onclick = () => selectFrame(f.index);
     box.append(row);
   }
+}
+
+async function selectFrame(index) {
+  if (S.mode !== 'dbg-pause') {
+    const f = S.frames.find((x) => x.index === index);
+    if (f) gotoLocation(f.file, f.line);
+    return;
+  }
+  const view = await call(window.ide.debug.selectFrame, index);
+  if (!view) return;
+  applyFrameView(view);
+}
+
+// 枠を選んだあと（または止まった直後）の画面の作り直し
+function applyFrameView(view) {
+  S.frameIndex = view.frameIndex || 0;
+  S.stopAt = { ...(S.stopAt || {}), file: view.file, line: view.line, column: view.column };
+  showVars(view.vars, view.locals);
+  $('frame-label').textContent = view.func ? `#${S.frameIndex} ${view.func}` : '';
+  showFrames(S.frames);
+  if (view.file) gotoLocation(view.file, view.line, view.column).then(() => {
+    paintDecorations();
+    paintInlineValues();
+  });
 }
 
 /* ────────────────────────────────────────────────────────
@@ -755,18 +1361,44 @@ function onAppEvent({ type, payload }) {
     case 'debug:stopped': {
       setMode('dbg-pause');
       S.stopAt = payload;
-      showFrames(payload.frames);
-      $('locals').textContent = explainLocals(payload.locals);
-      if (payload.file) gotoLocation(payload.file, payload.line, payload.column).then(paintDecorations);
-      else paintDecorations();
+      S.frames = payload.frames || [];
+      S.frameIndex = payload.frameIndex || 0;
+      showFrames(S.frames);
+      showVars(payload.vars, payload.locals);
+      $('frame-label').textContent = payload.func ? `#${S.frameIndex} ${payload.func}` : '';
+      // ★ 止まった先が別のファイル（import した先・標準ライブラリ）でも、
+      //   そのファイルを開いて、その行を出します。
+      if (payload.file) {
+        gotoLocation(payload.file, payload.line, payload.column).then(() => {
+          paintDecorations();
+          paintInlineValues();
+        });
+      } else {
+        paintDecorations();
+      }
       writeConsole('info', `⏸ ${base(payload.file || '')}:${payload.line}（${payload.reason}）\n`);
       break;
     }
 
+    // 呼び出し履歴で別の枠を選んだとき（main 側から返ってくる形は同じ）
+    case 'debug:frame':
+      applyFrameView(payload);
+      break;
+
+    // ブレークポイントを置けたか（置けない＝その行が実行ファイルに無い）
+    case 'debug:breakpoints':
+      for (const b of payload || []) S.bpState.set(b.file + ':' + b.line, b.resolved);
+      renderBreakpointList();
+      paintDecorations();
+      break;
+
     case 'debug:exited':
       setMode('idle');
       showFrames([]);
-      $('locals').textContent = '';
+      showVars([], '');
+      S.bpState.clear();
+      renderBreakpointList();
+      if (inlineValues) inlineValues.clear();
       break;
 
     case 'debug:log':
@@ -792,7 +1424,21 @@ function onMenu(cmd) {
     'run': doRun,
     'stop': doStop,
     'debug': doDebug,
+    'debug-or-continue': debugOrContinue,
+    'goto-definition': gotoDefinition,
+    'go-back': goBack,
+    'set-entry': () => {
+      const p = currentYs();
+      if (!p) { toast('.ys のファイルを開いてください。'); return; }
+      setEntry(p);
+      writeConsole('info', `入口を ${base(p)} にしました。実行・デバッグはこのファイルを建てます。\n`);
+    },
+    'clear-entry': () => {
+      setEntry('');
+      writeConsole('info', '入口の指定をやめました（開いている .ys を建てます）。\n');
+    },
     'continue': () => dbg('resume'),
+    'pause': doPause,
     'step-over': () => dbg('stepOver'),
     'step-into': () => dbg('stepInto'),
     'step-out': () => dbg('stepOut'),
@@ -824,6 +1470,10 @@ function setTheme(t) {
    設定
    ──────────────────────────────────────────────────────── */
 function wireSettings() {
+  $('set-entry-here').onclick = () => {
+    const p = currentYs();
+    if (p) $('set-entry').value = p;
+  };
   $('set-compiler-pick').onclick = async () => {
     const t = await call(window.ide.toolchain.pickCompiler);
     if (t) {
@@ -836,6 +1486,8 @@ function wireSettings() {
   $('settings-dialog').addEventListener('close', async (e) => {
     const dlg = $('settings-dialog');
     if (dlg.returnValue !== 'save') return;
+    // ★ 入口はフォルダごとに覚えます（設定そのものには混ぜません）。
+    setEntry($('set-entry').value.trim());
     const patch = {
       compilerPath: $('set-compiler').value.trim(),
       debuggerPath: $('set-debugger').value.trim(),
@@ -855,6 +1507,7 @@ async function openSettings() {
   $('set-compiler').value = S.settings.compilerPath || '';
   $('set-debugger').value = S.settings.debuggerPath || '';
   $('set-opt').value = S.settings.optLevel || '-O0';
+  $('set-entry').value = S.entry || '';
   $('set-extra').value = S.settings.extraArgs || '';
   $('set-font').value = S.settings.fontSize || 14;
   $('set-autosave').checked = !!S.settings.autoSaveBeforeBuild;
@@ -871,6 +1524,7 @@ function renderToolReport() {
     `runtime.a  : ${t.runtime || '（コンパイラ自身が探します）'}`,
     `標準ライブラリ: ${t.libDir || '（コンパイラ自身が探します）'}`,
     `デバッガ   : ${t.debugger || '見つかりません'}`,
+    `入口       : ${S.entry || '（開いている .ys）'}`,
     `clang      : ${t.hasClang ? 'あり' : 'ありません（リンクできません）'}`,
   ].join('\n');
 }

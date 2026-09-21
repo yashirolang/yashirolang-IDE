@@ -99,6 +99,23 @@ function compilerEnv(compiler) {
   return env;
 }
 
+// 標準ライブラリの場所は、**処理系に訊くのがいちばん正しい**（`--print-lib-dir`）。
+// 置き方から割り出す resolveRuntime は、訊けなかったときの控えです。
+function libDirOf(compiler) {
+  try {
+    const out = execFileSync(compiler, ['--print-lib-dir'], {
+      env: compilerEnv(compiler),
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim();
+    if (out && fs.existsSync(out)) return out;
+  } catch {
+    // 古い処理系は --print-lib-dir を知りません。下で置き方から割り出します。
+  }
+  const rt = resolveRuntime(compiler);
+  return rt ? rt.lib : null;
+}
+
 function versionOf(compiler) {
   try {
     return execFileSync(compiler, ['--version'], {
@@ -120,11 +137,11 @@ function detect(settings) {
     compiler,
     compilerVersion: compiler ? versionOf(compiler) : null,
     runtime: rt ? rt.runtime : null,
-    libDir: rt ? rt.lib : null,
+    libDir: compiler ? libDirOf(compiler) : null,
     debugger: dbg ? dbg.path : null,
     debuggerKind: dbg ? dbg.kind : null,
     hasClang: !!which('clang'),
   };
 }
 
-module.exports = { detect, findCompiler, findDebugger, compilerEnv, which, isExecutable };
+module.exports = { detect, findCompiler, findDebugger, compilerEnv, libDirOf, which, isExecutable };
